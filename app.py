@@ -60,6 +60,11 @@ NEWS_KEY = os.getenv("NEWS_KEY")
 POLYGON_KEY = os.getenv("POLYGON_KEY")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 FRED_KEY = os.getenv("FRED_KEY")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_SECRET_KEY = os.getenv("BYBIT_SECRET_KEY")
+BLOFIN_API_KEY = os.getenv("BLOFIN_API_KEY")
+BLOFIN_SECRET_KEY = os.getenv("BLOFIN_SECRET_KEY")
+COINAPI_KEY = os.getenv("COINAPI_KEY")
 
 # Assets
 SPOT_ASSETS = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "USDCHF", "NZDUSD"]
@@ -69,6 +74,15 @@ OTC_ASSETS = [a + "-OTC" for a in SPOT_ASSETS]
 # of dictionaries containing outcome information. In a production system, this would be
 # persisted to a database or Redis.
 trade_history: Dict[str, List[Dict[str, Any]]] = {}
+
+# Track the last time a signal was generated for each asset.  This is used to
+# enforce a minimum cooldown between successive signals on the same pair.  If
+# multiple requests arrive in quick succession, subsequent calls within the
+# cooldown window will return a status of "cooldown" rather than producing a
+# new signal.  A sensible default of 60 seconds may be overridden by the
+# SIGNAL_COOLDOWN_SEC environment variable.
+last_signal_time: Dict[str, datetime] = {}
+SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "60"))
 
 # Load Advanced ML Models
 def load_ml_models():
@@ -283,33 +297,32 @@ def get_news_sentiment(asset: str) -> Dict[str, float]:
     score = random.uniform(0.3, 0.7)
     return {'sentiment': sentiment, 'score': score}
 
-def get_risk_sizing(df: pd.DataFrame, risk_per_trade: float = 0.01) -> float:
+def get_risk_sizing(prob: float, payout: float = 0.8, cap: float = 0.05) -> float:
     """
-    Determine the suggested stake size based on the asset's volatility using
-    the Average True Range (ATR) to scale position sizes. For binary options
-    without stop‑loss, we approximate ATR by the average high–low range. The
-    resulting stake percentage is bounded between 0.5% and 5% of account
-    equity, ensuring prudent risk management.
+    Calculate an optimal stake percentage using the Kelly criterion for
+    binary options.  The Kelly fraction f* = (b p − (1 − p)) / b where b is
+    the payout odds (e.g. 0.8 for an 80% return) and p is the predicted
+    probability of success.  The fraction is bounded to the provided cap to
+    avoid over‑sizing and returned as a percentage of account equity.
 
     Args:
-        df: DataFrame of OHLCV data.
-        risk_per_trade: Base risk fraction of account (default 1%).
+        prob: Calibrated probability of the trade being a win (0–1).
+        payout: Payout odds (e.g. 0.8 for 80%).
+        cap: Maximum fraction of account to risk (default 5%).
 
     Returns:
-        A stake percentage between 0.5 and 5 (representing % of account).
+        Stake percentage (0–100) representing how much of the account
+        should be allocated to this trade.
     """
-    # compute ATR as the rolling average of true range (high‑low) over 14 periods
-    true_ranges = df['high'] - df['low']
-    atr = true_ranges.tail(14).mean()
-    price = df['close'].iloc[-1]
-    if price <= 0 or atr <= 0 or np.isnan(atr):
-        return risk_per_trade * 100  # default stake
-    # convert ATR to fraction of price
-    atr_pct = atr / price
-    # Kelly approximation: risk per trade / ATR percentage
-    stake_pct = (risk_per_trade / atr_pct) * 100
-    # bound between 0.5% and 5%
-    return max(0.5, min(5.0, stake_pct))
+    p = max(0.0, min(1.0, prob))
+    q = 1.0 - p
+    b = payout
+    # Kelly formula for binary options
+    f_star = (b * p - q) / b
+    # Never risk negative or unreasonably high amounts
+    f_star = max(0.0, min(cap, f_star))
+    # convert to percentage
+    return f_star * 100
 
 def detect_confirmed_pattern(df: pd.DataFrame) -> tuple:
     """
@@ -398,6 +411,25 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
     try:
         logger.info(f"Generating premium signal {signal_id} for {asset}")
 
+        # enforce cooldown: if the last signal for this asset was generated less than
+        # SIGNAL_COOLDOWN_SEC seconds ago, return a cooldown response rather
+        # than generating a new trade.  This prevents over‑trading on the same
+        # pair and adheres to user‑defined refresh intervals.
+        now = datetime.utcnow()
+        last_time = last_signal_time.get(asset)
+        if last_time:
+            elapsed = (now - last_time).total_seconds()
+            if elapsed < SIGNAL_COOLDOWN_SEC:
+                remaining = int(SIGNAL_COOLDOWN_SEC - elapsed)
+                return {
+                    "id": signal_id,
+                    "status": "cooldown",
+                    "message": f"Cooldown active, wait {remaining}s before next signal",
+                    "asset": asset,
+                    "timestamp": now.isoformat(),
+                    "expires_in": remaining
+                }
+
         # 1. SESSION FILTER
         if not is_optimal_session():
             return {
@@ -446,11 +478,20 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
         raw_conf = calibrated_conf + confluence_boost + sentiment_boost + pattern_boost
         # clamp final confidence between 70 and 95 to avoid unrealistic extremes
         final_confidence = max(70.0, min(95.0, raw_conf))
+        # Determine the call/put direction based on the aggregate technical score
         direction = 'CALL' if direction_multiplier > 0 else 'PUT'
         current_price = df['close'].iloc[-1]
 
+        # Classify signals into confidence tiers for user‑friendly labels
+        if final_confidence >= 85:
+            tier = "Gold"
+        elif final_confidence >= 75:
+            tier = "Silver"
+        else:
+            tier = "Bronze"
+
         # 9. RISK SIZING
-        risk_pct = get_risk_sizing(df)
+        risk_pct = get_risk_sizing(base_prob, payout=0.8, cap=0.05)
 
         # 10. PERFORMANCE STATS
         perf_stats = get_performance_stats(asset)
@@ -462,6 +503,7 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
             "asset": asset,
             "price": round(current_price, 5),
             "confidence": round(final_confidence, 1),
+            "tier": tier,
             "expire": timeframe,
             "is_otc": is_otc,
             "confluence_score": round(confluence_boost, 1),
@@ -469,7 +511,7 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
             "sentiment_score": round(sentiment_data['score'] * 100, 1),
             "pattern": pattern_name,
             "pattern_win_rate": pattern_win_rate,
-            "risk_pct": round(risk_pct * 100, 1),
+            "risk_pct": round(risk_pct, 2),
             "technical": {
                 "rsi": round(rsi, 1),
                 "macd_diff": round(macd_diff, 4),
@@ -518,6 +560,9 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
             'result': None  # pending outcome
         })
 
+        # update last signal time for cooldown enforcement
+        last_signal_time[asset] = now
+
         logger.info(f"✅ Premium signal generated: {direction} {asset} ({final_confidence}%)")
         return signal_data
 
@@ -554,6 +599,15 @@ def send_advanced_telegram(signal: Dict[str, Any]):
 
 Powered by Premium AI Engine • 85-95% Historical Performance
 """
+        # Override the long‑form message with a simplified alert for Telegram users.
+        message = (
+            f"🚨 *SIGNAL ALERT* 🚨\n"
+            f"*Asset:* {signal['asset']} ({'OTC' if signal['is_otc'] else 'Spot'})\n"
+            f"*Direction:* {signal['direction']}\n"
+            f"*Expiry:* {signal['expire']}\n"
+            f"*Confidence:* {signal['confidence']}%\n"
+            f"*Payout:* 80%\n"
+        )
         response = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={
