@@ -67,32 +67,44 @@ OTC_ASSETS = [a + "-OTC" for a in SPOT_ASSETS]
 
 # Load Advanced ML Models
 def load_ml_models():
+    """
+    Load machine learning models from disk if available, otherwise create new ones.
+    Regardless of the state on disk, always train a calibrated classifier with six
+    features to ensure that the prediction step receives the expected input
+    dimensionality. If pretrained models exist for confluence and sentiment,
+    reuse them; otherwise generate synthetic training data and persist them.
+    """
+    # Try to load existing models from disk. If any fail, create fresh ones.
     try:
         confluence_model = joblib.load("models/confluence_model.pkl")
-        sentiment_model = joblib.load("models/sentiment_model.pkl")
-        calibrated_model = joblib.load("models/calibrated_model.pkl")
-        logger.info("✅ Loaded all ML models")
-    except:
-        # Create models
+        logger.info("✅ Loaded confluence model from disk")
+    except Exception:
         X_confluence, y_confluence = np.random.rand(2000, 6), np.random.randint(0, 4, 2000)
         confluence_model = GradientBoostingClassifier().fit(X_confluence, y_confluence)
-
-        X_sentiment, y_sentiment = np.random.rand(1500, 5), np.random.randint(0, 2, 1500)  # Fixed: binary classification
-        sentiment_model = RandomForestClassifier().fit(X_sentiment, y_sentiment)
-
-        # Train calibrated model on synthetic data with six features to match the
-        # feature vector used in prediction (RSI, MACD diff, stochastic K, ATR,
-        # normalized confluence boost, sentiment score). Without this, the
-        # prediction step will raise a shape mismatch error.
-        X_calib, y_calib = np.random.rand(1000, 6), np.random.randint(0, 2, 1000)
-        base_model = RandomForestClassifier()
-        calibrated_model = CalibratedClassifierCV(base_model, method='isotonic').fit(X_calib, y_calib)
-
         os.makedirs("models", exist_ok=True)
         joblib.dump(confluence_model, "models/confluence_model.pkl")
+        logger.info("✅ Trained and saved new confluence model")
+
+    try:
+        sentiment_model = joblib.load("models/sentiment_model.pkl")
+        logger.info("✅ Loaded sentiment model from disk")
+    except Exception:
+        X_sentiment, y_sentiment = np.random.rand(1500, 5), np.random.randint(0, 2, 1500)
+        sentiment_model = RandomForestClassifier().fit(X_sentiment, y_sentiment)
+        os.makedirs("models", exist_ok=True)
         joblib.dump(sentiment_model, "models/sentiment_model.pkl")
-        joblib.dump(calibrated_model, "models/calibrated_model.pkl")
-        logger.info("✅ Created and saved ML models")
+        logger.info("✅ Trained and saved new sentiment model")
+
+    # Always create a calibrated classifier using six features. This prevents
+    # shape-mismatch errors when calling predict_proba on the feature vector
+    # constructed in generate_premium_signal. Persist the model for subsequent runs.
+    X_calib, y_calib = np.random.rand(1000, 6), np.random.randint(0, 2, 1000)
+    base_model = RandomForestClassifier()
+    calibrated_model = CalibratedClassifierCV(base_model, method='isotonic').fit(X_calib, y_calib)
+    os.makedirs("models", exist_ok=True)
+    joblib.dump(calibrated_model, "models/calibrated_model.pkl")
+    logger.info("✅ Trained and saved new calibrated model with six features")
+
     return confluence_model, sentiment_model, calibrated_model
 
 confluence_model, sentiment_model, calibrated_model = load_ml_models()
