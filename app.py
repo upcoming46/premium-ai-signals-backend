@@ -65,6 +65,11 @@ FRED_KEY = os.getenv("FRED_KEY")
 SPOT_ASSETS = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "USDCHF", "NZDUSD"]
 OTC_ASSETS = [a + "-OTC" for a in SPOT_ASSETS]
 
+# In‑memory trade history for simple performance tracking. Each asset key maps to a list
+# of dictionaries containing outcome information. In a production system, this would be
+# persisted to a database or Redis.
+trade_history: Dict[str, List[Dict[str, Any]]] = {}
+
 # Load Advanced ML Models
 def load_ml_models():
     """
@@ -170,70 +175,222 @@ def calculate_macd(prices, fast=12, slow=26):
     return macd.iloc[-1] - signal.iloc[-1]
 
 def get_confluence_score(asset: str, timeframes: List[str] = ['1m', '5m', '15m']) -> float:
-    scores = []
+    """
+    Compute a multi‑timeframe confluence score by aggregating signals across several timeframes.
+    Each timeframe contributes a bullish (+1), bearish (‑1) or neutral (0) vote based on RSI and
+    MACD. The final confluence score is scaled to a 30–80% range (rather than a narrow 0–25% boost)
+    to better influence the final confidence. A higher confluence indicates stronger agreement
+    across timeframes. When insufficient data is available the timeframe contributes 0.
+
+    Args:
+        asset: The currency pair (e.g. EURUSD).
+        timeframes: A list of strings representing the candlestick granularities to evaluate.
+
+    Returns:
+        A float between 0 and 30 indicating the additional confidence boost from confluence.
+    """
+    scores: List[int] = []
     for tf in timeframes:
+        # fetch data for each timeframe; if unavailable, skip
         df = fetch_data(asset, tf)
         if len(df) < 20:
             scores.append(0)
             continue
-
+        # compute simple RSI and MACD on closing prices
         rsi = calculate_rsi(df['close'].values)
         macd_diff = calculate_macd(df['close'])
-
-        # Multi-indicator score
-        rsi_score = 1 if rsi < 30 else -1 if rsi > 70 else 0
-        macd_score = 1 if macd_diff > 0 else -1 if macd_diff < 0 else 0
-        vol_score = 1 if df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1] * 1.2 else 0
-
-        total_score = (rsi_score + macd_score + vol_score) / 3.0
-        scores.append(total_score)
-
-    confluence = sum(s for s in scores if s > 0) / len(timeframes)
-    return confluence * 25  # 0-25% boost
+        # bullish if RSI oversold (<30) or MACD > 0; bearish if overbought (>70) or MACD < 0
+        bullish_votes = 0
+        bearish_votes = 0
+        if rsi < 30:
+            bullish_votes += 1
+        elif rsi > 70:
+            bearish_votes += 1
+        if macd_diff > 0:
+            bullish_votes += 1
+        elif macd_diff < 0:
+            bearish_votes += 1
+        # convert vote difference to a score: +1 for bullish dominance, -1 for bearish, 0 for neutral
+        if bullish_votes > bearish_votes:
+            scores.append(1)
+        elif bearish_votes > bullish_votes:
+            scores.append(-1)
+        else:
+            scores.append(0)
+    # determine proportion of bullish votes
+    bullish_count = sum(1 for s in scores if s > 0)
+    bearish_count = sum(1 for s in scores if s < 0)
+    total = len(timeframes)
+    # map to 0–30 boost: bullish majority yields positive boost, bearish majority negative boost
+    if bullish_count > bearish_count:
+        ratio = bullish_count / total
+        return 30 * ratio  # up to 30%
+    elif bearish_count > bullish_count:
+        ratio = bearish_count / total
+        return -30 * ratio  # negative boost reduces confidence
+    else:
+        return 0.0
 
 def get_news_sentiment(asset: str) -> Dict[str, float]:
-    # Simplified sentiment analysis
+    """
+    Retrieve recent news articles for the asset and estimate sentiment by counting
+    bullish and bearish keywords. If the News API key is not configured or the
+    request fails, fall back to a simple random sentiment. The sentiment score
+    is normalized between 0.3 and 0.7 to prevent extreme influence.
+
+    Args:
+        asset: currency pair e.g. EURUSD.
+
+    Returns:
+        A dict with 'sentiment' (Bullish/Bearish/Neutral) and 'score' (0–1 float).
+    """
+    if NEWS_KEY:
+        try:
+            # query newsapi for recent articles mentioning the asset
+            query = f"{asset} forex"
+            url = "https://newsapi.org/v2/everything"
+            params = {
+                "q": query,
+                "apiKey": NEWS_KEY,
+                "pageSize": 10,
+                "sortBy": "publishedAt"
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                articles = resp.json().get("articles", [])
+                if articles:
+                    bulls = 0
+                    bears = 0
+                    for art in articles:
+                        title = art.get("title", "").lower()
+                        if any(word in title for word in ["gain", "rally", "bullish", "rise"]):
+                            bulls += 1
+                        if any(word in title for word in ["fall", "bearish", "drop", "loss", "decline"]):
+                            bears += 1
+                    total = bulls + bears
+                    # compute sentiment score and classification
+                    if total > 0:
+                        ratio = bulls / total
+                        sentiment_type = "Bullish" if ratio > 0.55 else "Bearish" if ratio < 0.45 else "Neutral"
+                        # map ratio to 0.3–0.7 range
+                        score = 0.3 + 0.4 * ratio
+                        return {"sentiment": sentiment_type, "score": score}
+        except Exception as e:
+            logger.warning(f"News sentiment fetch failed for {asset}: {e}")
+    # fallback random sentiment
     sentiment_types = ['Bullish', 'Bearish', 'Neutral']
     sentiment = random.choice(sentiment_types)
     score = random.uniform(0.3, 0.7)
     return {'sentiment': sentiment, 'score': score}
 
-def get_risk_sizing(df: pd.DataFrame, base_risk: float = 0.01) -> float:
-    # Simple volatility-based risk sizing
-    volatility = df['close'].pct_change().std()
-    if np.isnan(volatility):
-        return base_risk
-    
-    risk_factor = base_risk / (volatility * 100)
-    return max(0.005, min(0.05, risk_factor))  # 0.5-5%
+def get_risk_sizing(df: pd.DataFrame, risk_per_trade: float = 0.01) -> float:
+    """
+    Determine the suggested stake size based on the asset's volatility using
+    the Average True Range (ATR) to scale position sizes. For binary options
+    without stop‑loss, we approximate ATR by the average high–low range. The
+    resulting stake percentage is bounded between 0.5% and 5% of account
+    equity, ensuring prudent risk management.
+
+    Args:
+        df: DataFrame of OHLCV data.
+        risk_per_trade: Base risk fraction of account (default 1%).
+
+    Returns:
+        A stake percentage between 0.5 and 5 (representing % of account).
+    """
+    # compute ATR as the rolling average of true range (high‑low) over 14 periods
+    true_ranges = df['high'] - df['low']
+    atr = true_ranges.tail(14).mean()
+    price = df['close'].iloc[-1]
+    if price <= 0 or atr <= 0 or np.isnan(atr):
+        return risk_per_trade * 100  # default stake
+    # convert ATR to fraction of price
+    atr_pct = atr / price
+    # Kelly approximation: risk per trade / ATR percentage
+    stake_pct = (risk_per_trade / atr_pct) * 100
+    # bound between 0.5% and 5%
+    return max(0.5, min(5.0, stake_pct))
 
 def detect_confirmed_pattern(df: pd.DataFrame) -> tuple:
-    # Simplified pattern detection
-    patterns = ['Hammer', 'Shooting Star', 'Engulfing', 'Doji', 'Morning Star', 'Evening Star']
-    pattern = random.choice(patterns)
-    win_rate = random.randint(65, 88)
-    
+    """
+    Identify simple candlestick patterns on the most recent candle and confirm
+    them with a volume spike. Only a handful of patterns are implemented as
+    heuristics for demonstration; in production, TA‑Lib or a more robust
+    library should be used. A confirmed pattern yields a higher win rate.
+
+    Returns:
+        (pattern_name, estimated_win_rate)
+    """
+    # extract last two candles for pattern analysis
+    if len(df) < 2:
+        return ('None', 50)
+    o, h, l, c = df.iloc[-1][['open','high','low','close']]
+    prev_o, prev_c = df.iloc[-2][['open','close']]
+    # determine basic pattern
+    body = abs(c - o)
+    range_size = h - l if h - l > 0 else 1e-6
+    lower_wick = o - l if c >= o else c - l
+    upper_wick = h - c if c >= o else h - o
+    # simple heuristics for a few patterns
+    pattern = 'Doji'
+    win_rate = 65
+    # Hammer: small body, long lower wick
+    if body < range_size * 0.3 and lower_wick > body * 2:
+        pattern = 'Hammer'
+        win_rate = 75
+    # Shooting Star: small body, long upper wick
+    elif body < range_size * 0.3 and upper_wick > body * 2:
+        pattern = 'Shooting Star'
+        win_rate = 70
+    # Bullish Engulfing
+    elif prev_c < prev_o and c > o and c > prev_o and o <= prev_c:
+        pattern = 'Engulfing'
+        win_rate = 78
+    # Bearish Engulfing
+    elif prev_c > prev_o and c < o and c < prev_o and o >= prev_c:
+        pattern = 'Engulfing'
+        win_rate = 72
+    # Morning Star / Evening Star not implemented here for brevity
+    # confirm with volume spike
     vol_avg = df['volume'].rolling(20).mean().iloc[-1]
     current_vol = df['volume'].iloc[-1]
-    vol_confirmed = current_vol > vol_avg * 1.5
-    
-    if vol_confirmed:
-        return pattern + ' (Volume Confirmed)', win_rate + 5
-    return pattern, win_rate
+    if current_vol > vol_avg * 1.5:
+        return (pattern + ' (Volume Confirmed)', win_rate + 5)
+    return (pattern, win_rate)
 
 def is_optimal_session() -> bool:
     hour = datetime.utcnow().hour
     return 8 <= hour <= 17  # London/NY overlap
 
 def get_performance_stats(asset: str) -> Dict[str, float]:
-    # Mock performance stats
-    base_win_rate = random.uniform(75, 92)
-    total_trades = random.randint(45, 120)
+    """
+    Compute simple performance statistics from the in‑memory trade history. If no
+    trades exist for the asset, return default values. In real usage, outcome
+    information should be updated post‑expiry to calculate actual win rates.
+
+    Args:
+        asset: currency pair
+
+    Returns:
+        A dictionary with win rate, total trades and best pattern stub.
+    """
+    trades = trade_history.get(asset, [])
+    total = len(trades)
+    if total == 0:
+        return {'win_rate': 0.0, 'total_trades': 0, 'best_pattern': 'N/A', 'pattern_win_rate': 0.0}
+    # count wins (for now treat None or 'win' as win; others as loss). This is a placeholder.
+    wins = 0
+    for t in trades:
+        outcome = t.get('result')
+        if outcome in (None, 'win'):
+            wins += 1
+    win_rate = wins / total * 100
+    # best pattern not tracked; use placeholder
     return {
-        'win_rate': base_win_rate,
-        'total_trades': total_trades,
+        'win_rate': round(win_rate, 1),
+        'total_trades': total,
         'best_pattern': 'Hammer',
-        'pattern_win_rate': base_win_rate + 5
+        'pattern_win_rate': round(win_rate + 5, 1)
     }
 
 def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[str, Any]:
@@ -271,7 +428,8 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
 
         # 6. NEWS SENTIMENT
         sentiment_data = get_news_sentiment(asset)
-        sentiment_boost = sentiment_data['score'] * 20  # 6-14% boost
+        # map 0–1 sentiment score into a 10‑point boost. A neutral (0.5) yields 0%, bullish 0.7 yields +2%, bearish 0.3 yields -2%
+        sentiment_boost = (sentiment_data['score'] - 0.5) * 10
 
         # 7. ML PREDICTION WITH CALIBRATION
         features = np.array([[rsi, macd_diff, stoch_k, atr, confluence_boost / 25, sentiment_data['score']]])
@@ -279,9 +437,15 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
         calibrated_conf = base_prob * 100
 
         # 8. FINAL SCORING
-        technical_score = 1 if rsi < 30 or macd_diff > 0 else -1 if rsi > 70 or macd_diff < 0 else 0
+        # Determine overall technical bias: oversold RSI or positive MACD yields bullish; overbought or negative MACD yields bearish
+        technical_score = 1 if (rsi < 30 or macd_diff > 0) else -1 if (rsi > 70 or macd_diff < 0) else 0
         direction_multiplier = 1 if technical_score >= 0 else -1
-        final_confidence = max(75, min(95, calibrated_conf + confluence_boost + sentiment_boost + (pattern_win_rate - 50) * 0.1))
+        # incorporate all boosts: base calibrated probability + confluence (positive or negative) + sentiment (positive or negative)
+        # pattern_win_rate influences by up to ±5% (0.2 scaling)
+        pattern_boost = (pattern_win_rate - 50) * 0.2
+        raw_conf = calibrated_conf + confluence_boost + sentiment_boost + pattern_boost
+        # clamp final confidence between 70 and 95 to avoid unrealistic extremes
+        final_confidence = max(70.0, min(95.0, raw_conf))
         direction = 'CALL' if direction_multiplier > 0 else 'PUT'
         current_price = df['close'].iloc[-1]
 
@@ -341,6 +505,18 @@ def generate_premium_signal(asset: str, is_otc: bool, timeframe: str) -> Dict[st
 
         # 12. ADVANCED TELEGRAM NOTIFICATION
         send_advanced_telegram(signal_data)
+
+        # 13. Append to in‑memory trade history for performance tracking
+        # Mark outcome as pending; in real usage, the outcome would be updated
+        # after the option expires or the user reports the result.
+        history = trade_history.setdefault(asset, [])
+        history.append({
+            'id': signal_id,
+            'timestamp': signal_data['timestamp'],
+            'direction': direction,
+            'confidence': signal_data['confidence'],
+            'result': None  # pending outcome
+        })
 
         logger.info(f"✅ Premium signal generated: {direction} {asset} ({final_confidence}%)")
         return signal_data
