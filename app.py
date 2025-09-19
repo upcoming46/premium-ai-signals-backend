@@ -80,7 +80,11 @@ def load_ml_models():
         X_sentiment, y_sentiment = np.random.rand(1500, 5), np.random.randint(0, 2, 1500)  # Fixed: binary classification
         sentiment_model = RandomForestClassifier().fit(X_sentiment, y_sentiment)
 
-        X_calib, y_calib = np.random.rand(1000, 4), np.random.randint(0, 2, 1000)
+        # Train calibrated model on synthetic data with six features to match the
+        # feature vector used in prediction (RSI, MACD diff, stochastic K, ATR,
+        # normalized confluence boost, sentiment score). Without this, the
+        # prediction step will raise a shape mismatch error.
+        X_calib, y_calib = np.random.rand(1000, 6), np.random.randint(0, 2, 1000)
         base_model = RandomForestClassifier()
         calibrated_model = CalibratedClassifierCV(base_model, method='isotonic').fit(X_calib, y_calib)
 
